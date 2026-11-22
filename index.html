@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Mines Fairness Verifier</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0f1923);
+    --card: var(--tg-theme-secondary-bg-color, #1a2c38);
+    --text: var(--tg-theme-text-color, #e8eef2);
+    --hint: var(--tg-theme-hint-color, #8aa0ad);
+    --accent: var(--tg-theme-button-color, #1f8fff);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --ok: #22c55e;
+    --bad: #ef4444;
+    --gem: #22c55e;
+    --mine: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--hint); font-size: 13px; margin: 0 0 16px; line-height: 1.4; }
+  .card { background: var(--card); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  label { display: block; font-size: 13px; color: var(--hint); margin: 10px 0 4px; }
+  label:first-child { margin-top: 0; }
+  input {
+    width: 100%; padding: 11px 12px; border-radius: 8px;
+    border: 1px solid rgba(138,160,173,.3); background: var(--bg); color: var(--text);
+    font-size: 15px; font-family: ui-monospace, Menlo, monospace;
+  }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%; margin-top: 14px; padding: 13px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-text); font-size: 16px; font-weight: 600;
+  }
+  .grid {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
+    max-width: 320px; margin: 4px auto 0;
+  }
+  .tile {
+    aspect-ratio: 1; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-size: 22px; background: rgba(34,197,94,.15); border: 2px solid rgba(34,197,94,.4);
+  }
+  .tile.mine { background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.55); }
+  .status { font-size: 14px; padding: 10px 12px; border-radius: 8px; margin-bottom: 10px; line-height: 1.4; }
+  .status.ok { background: rgba(34,197,94,.15); color: var(--ok); }
+  .status.bad { background: rgba(239,68,68,.15); color: var(--bad); }
+  .status.info { background: rgba(138,160,173,.15); color: var(--hint); }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; color: var(--hint); }
+  details { margin-top: 10px; font-size: 13px; color: var(--hint); }
+  summary { cursor: pointer; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>💎 Mines Fairness Verifier</h1>
+  <p class="sub">Checks a <b>finished</b> Stake Mines game. Rotate your seed pair first, then paste the revealed (unhashed) server seed here. This can't predict games, because the server seed stays secret until you rotate it.</p>
+
+  <div class="card">
+    <label for="server">Server seed (unhashed, revealed after rotating)</label>
+    <input id="server" autocomplete="off" spellcheck="false" placeholder="64-char hex string">
+
+    <label for="hashed">Server seed hash you saw before (optional)</label>
+    <input id="hashed" autocomplete="off" spellcheck="false" placeholder="checks Stake didn't swap the seed">
+
+    <label for="client">Client seed</label>
+    <input id="client" autocomplete="off" spellcheck="false" placeholder="e.g. 1166d9dfba31359d">
+
+    <div class="row">
+      <div>
+        <label for="nonce">Nonce (bet number)</label>
+        <input id="nonce" type="number" inputmode="numeric" min="0" value="0">
+      </div>
+      <div>
+        <label for="mines">Mines</label>
+        <input id="mines" type="number" inputmode="numeric" min="1" max="24" value="3">
+      </div>
+    </div>
+
+    <button id="go">Verify game</button>
+  </div>
+
+  <div class="card hidden" id="result">
+    <div id="hashStatus"></div>
+    <div class="grid" id="grid"></div>
+    <details>
+      <summary>How this was calculated</summary>
+      <p>1. Bytes = HMAC-SHA256(key = server seed, message = "clientSeed:nonce:round"), with round = 0, 1, 2… until there are enough bytes.</p>
+      <p>2. Each 4 bytes become a float in [0, 1): b0/256 + b1/256² + b2/256³ + b3/256⁴.</p>
+      <p>3. Tiles 0–24 are shuffled: for float i, pick index ⌊float × (25 − i)⌋ from the tiles left. The first N picks are the mines.</p>
+      <p>Tiles are numbered row by row from the top-left (0 = top-left, 4 = top-right, 24 = bottom-right).</p>
+      <p class="mono" id="mineList"></p>
+    </details>
+  </div>
+
+<script>
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  const enc = new TextEncoder();
+  const toHex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+
+  async function sha256Hex(text) {
+    return toHex(await crypto.subtle.digest("SHA-256", enc.encode(text)));
+  }
+
+  async function hmacBytes(key, message) {
+    const k = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(message)));
+  }
+
+  // Stake-style float generation: 8 floats per 32-byte HMAC round
+  async function generateFloats(serverSeed, clientSeed, nonce, count) {
+    const floats = [];
+    let round = 0;
+    while (floats.length < count) {
+      const bytes = await hmacBytes(serverSeed, `${clientSeed}:${nonce}:${round}`);
+      for (let i = 0; i < 32 && floats.length < count; i += 4) {
+        let f = 0;
+        for (let j = 0; j < 4; j++) f += bytes[i + j] / Math.pow(256, j + 1);
+        floats.push(f);
+      }
+      round++;
+    }
+    return floats;
+  }
+
+  async function mineTiles(serverSeed, clientSeed, nonce, mineCount) {
+    const floats = await generateFloats(serverSeed, clientSeed, nonce, 24);
+    const remaining = [...Array(25).keys()];
+    const order = floats.map((f, i) => remaining.splice(Math.floor(f * (25 - i)), 1)[0]);
+    return order.slice(0, mineCount);
+  }
+
+  function setStatus(cls, html) {
+    const el = document.getElementById("hashStatus");
+    el.className = "status " + cls;
+    el.innerHTML = html;
+  }
+
+  document.getElementById("go").addEventListener("click", async () => {
+    const server = document.getElementById("server").value.trim();
+    const hashed = document.getElementById("hashed").value.trim().toLowerCase();
+    const client = document.getElementById("client").value.trim();
+    const nonce = parseInt(document.getElementById("nonce").value, 10);
+    const mines = parseInt(document.getElementById("mines").value, 10);
+
+    if (!server || !client || isNaN(nonce) || nonce < 0 || isNaN(mines) || mines < 1 || mines > 24) {
+      const msg = "Fill in server seed, client seed, a nonce of 0 or more, and 1–24 mines.";
+      tg ? tg.showAlert(msg) : alert(msg);
+      return;
+    }
+
+    document.getElementById("result").classList.remove("hidden");
+    const actualHash = await sha256Hex(server);
+    if (hashed) {
+      if (actualHash === hashed) setStatus("ok", "✅ Server seed matches the hash shown before the games. It wasn't changed.");
+      else setStatus("bad", "❌ Hash mismatch. Check that you copied both values exactly.<br><span class='mono'>SHA-256 of your seed: " + actualHash + "</span>");
+    } else {
+      setStatus("info", "SHA-256 of this server seed:<br><span class='mono'>" + actualHash + "</span>");
+    }
+
+    const mineSet = await mineTiles(server, client, nonce, mines);
+    const grid = document.getElementById("grid");
+    grid.innerHTML = "";
+    for (let i = 0; i < 25; i++) {
+      const t = document.createElement("div");
+      const isMine = mineSet.includes(i);
+      t.className = "tile" + (isMine ? " mine" : "");
+      t.textContent = isMine ? "💣" : "💎";
+      grid.appendChild(t);
+    }
+    document.getElementById("mineList").textContent = "Mine tiles: " + [...mineSet].sort((a, b) => a - b).join(", ");
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  });
+</script>
+</body>
+</html>
